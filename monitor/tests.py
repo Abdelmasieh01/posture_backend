@@ -1,20 +1,26 @@
 """
-Automated test suite covering REST endpoints, idempotency, summary math, and WebSockets.
+Automated test suite covering REST endpoints, idempotency, summary math, WebSockets, and commands.
 Exists to verify all exam specification requirements with `python manage.py test`.
 Called by Django's test runner.
 """
 import uuid
 from datetime import datetime, timezone as dt_timezone
 from asgiref.sync import async_to_sync
+from channels.db import database_sync_to_async
 from channels.testing import WebsocketCommunicator
 from django.test import TestCase, TransactionTestCase
 
 from posture_backend.asgi import application
+from . import consumers
 from .models import AlertEvent, LatestStatus, MinuteAggregate
 
 
 class PostureBackendTests(TestCase):
     """Tests for REST endpoints, idempotent upserts, and Python summary calculations."""
+
+    def setUp(self):
+        # Ensure module-level counter starts clean for every test
+        consumers.connected_devices = 0
 
     def test_status_post_updates_single_row_and_latest_returns_it(self):
         # Initially 404 before any status arrives
@@ -144,9 +150,26 @@ class PostureBackendTests(TestCase):
         self.assertIsNone(b1["avg_distance_cm"])
         self.assertEqual(b1["alert_count"], 0)
 
+    def test_commands_bad_input_and_offline_pi(self):
+        # Missing or invalid command -> 400
+        bad_res = self.client.post(
+            "/api/commands/", {"command": "reboot_pi"}, content_type="application/json"
+        )
+        self.assertEqual(bad_res.status_code, 400)
+
+        # Valid command when no Pi is connected -> 503
+        offline_res = self.client.post(
+            "/api/commands/", {"command": "calibrate_camera"}, content_type="application/json"
+        )
+        self.assertEqual(offline_res.status_code, 503)
+        self.assertEqual(offline_res.json(), {"detail": "Pi not connected"})
+
 
 class WebSocketTests(TransactionTestCase):
-    """Tests for WebSocket initial status push and live broadcasts from REST views."""
+    """Tests for WebSocket initial status push, live broadcasts, and remote calibration."""
+
+    def setUp(self):
+        consumers.connected_devices = 0
 
     def test_websocket_receives_initial_status_and_broadcasts(self):
         # Seed an initial LatestStatus via POST /api/status/
@@ -164,15 +187,22 @@ class WebSocketTests(TransactionTestCase):
             content_type="application/json",
         )
 
+        @database_sync_to_async
+        def database_post(path, data):
+            return self.client.post(path, data, content_type="application/json")
+
         async def run_ws_flow():
             communicator = WebsocketCommunicator(application, "/ws/notifications/")
             connected, _ = await communicator.connect()
             self.assertTrue(connected)
 
-            # 1. Immediately upon connect, the client receives the existing LatestStatus
+            # 1. Immediately upon connect, the client receives LatestStatus then device status
             initial_msg = await communicator.receive_json_from()
             self.assertEqual(initial_msg["type"], "status")
             self.assertEqual(initial_msg["data"]["label"], "goodposture")
+
+            device_msg = await communicator.receive_json_from()
+            self.assertEqual(device_msg, {"type": "device", "data": {"connected": False}})
 
             # 2. Posting a new status broadcasts a "status" message to connected clients
             await database_post(
@@ -222,10 +252,87 @@ class WebSocketTests(TransactionTestCase):
             self.assertTrue(await communicator.receive_nothing())
             await communicator.disconnect()
 
-        from channels.db import database_sync_to_async
+        async_to_sync(run_ws_flow)()
+
+    def test_device_connection_commands_and_results(self):
+        @database_sync_to_async
+        def http_get(path):
+            return self.client.get(path)
 
         @database_sync_to_async
-        def database_post(path, data):
+        def http_post(path, data):
             return self.client.post(path, data, content_type="application/json")
 
-        async_to_sync(run_ws_flow)()
+        async def run_device_flow():
+            # Initially GET /api/device/ reports connected=False
+            r0 = await http_get("/api/device/")
+            self.assertEqual(r0.json(), {"connected": False})
+
+            # Connect the Flutter app WebSocket first
+            app_ws = WebsocketCommunicator(application, "/ws/notifications/")
+            self.assertTrue((await app_ws.connect())[0])
+            # No LatestStatus exists, so the first message is the initial device state
+            self.assertEqual(
+                await app_ws.receive_json_from(),
+                {"type": "device", "data": {"connected": False}},
+            )
+
+            # Connect the Raspberry Pi WebSocket (/ws/device/)
+            pi_ws = WebsocketCommunicator(application, "/ws/device/")
+            self.assertTrue((await pi_ws.connect())[0])
+
+            # App receives {"type": "device", "data": {"connected": True}} and GET /api/device/ matches
+            self.assertEqual(
+                await app_ws.receive_json_from(),
+                {"type": "device", "data": {"connected": True}},
+            )
+            r1 = await http_get("/api/device/")
+            self.assertEqual(r1.json(), {"connected": True})
+
+            # POST /api/commands/ returns 202 and Pi receives {"type": "command", "command": ...}
+            cmd_res = await http_post("/api/commands/", {"command": "calibrate_distance"})
+            self.assertEqual(cmd_res.status_code, 202)
+            self.assertEqual(cmd_res.json(), {"sent": True, "command": "calibrate_distance"})
+            self.assertEqual(
+                await pi_ws.receive_json_from(),
+                {"type": "command", "command": "calibrate_distance"},
+            )
+
+            # Pi sends a valid command_result -> App receives it with a server-generated ISO ts
+            await pi_ws.send_json_to(
+                {
+                    "type": "command_result",
+                    "command": "calibrate_distance",
+                    "status": "recording",
+                    "detail": "Hold still for 3 seconds",
+                }
+            )
+            result_msg = await app_ws.receive_json_from()
+            self.assertEqual(result_msg["type"], "command_result")
+            self.assertEqual(result_msg["data"]["command"], "calibrate_distance")
+            self.assertEqual(result_msg["data"]["status"], "recording")
+            self.assertEqual(result_msg["data"]["detail"], "Hold still for 3 seconds")
+            self.assertTrue(result_msg["data"]["ts"].endswith("Z"))
+
+            # Pi sends an invalid command_result -> silently ignored (app receives nothing)
+            await pi_ws.send_json_to(
+                {
+                    "type": "command_result",
+                    "command": "calibrate_distance",
+                    "status": "exploded",
+                }
+            )
+            self.assertTrue(await app_ws.receive_nothing())
+
+            # Disconnect the Pi -> App receives connected=False and GET /api/device/ reflects it
+            await pi_ws.disconnect()
+            self.assertEqual(
+                await app_ws.receive_json_from(),
+                {"type": "device", "data": {"connected": False}},
+            )
+            r2 = await http_get("/api/device/")
+            self.assertEqual(r2.json(), {"connected": False})
+
+            await app_ws.disconnect()
+
+        async_to_sync(run_device_flow)()

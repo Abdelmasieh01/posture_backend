@@ -1,10 +1,13 @@
 """
-Input validation and JSON serialization for the monitor REST API.
-Exists to validate types, required fields, and ranges before touching the database.
-Called by views.py on every POST and GET request.
+Input validation and JSON serialization for the monitor REST API and WebSockets.
+Exists to validate types, required fields, and choices before touching the DB or Channels.
+Called by views.py and consumers.py on incoming payloads.
 """
 from rest_framework import serializers
 from .models import AlertEvent, LatestStatus, MinuteAggregate
+
+VALID_COMMANDS = ["calibrate_camera", "calibrate_distance"]
+VALID_COMMAND_STATUSES = ["get_ready", "recording", "done", "failed"]
 
 
 def format_iso_utc(dt) -> str:
@@ -87,3 +90,16 @@ class MinuteAggregateSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["created_at"]
+
+
+class CommandSerializer(serializers.Serializer):
+    """Validates POST /api/commands/ requests from the Flutter app."""
+    command = serializers.ChoiceField(choices=VALID_COMMANDS)
+
+
+class CommandResultSerializer(serializers.Serializer):
+    """Validates calibration progress messages sent by the Pi over /ws/device/."""
+    type = serializers.ChoiceField(choices=["command_result"])
+    command = serializers.ChoiceField(choices=VALID_COMMANDS)
+    status = serializers.ChoiceField(choices=VALID_COMMAND_STATUSES)
+    detail = serializers.CharField(required=False, allow_blank=True, default="")

@@ -1,6 +1,6 @@
 # Posture Monitor Demo Backend (`posture_backend`)
 
-A lightweight, single-process Django 5 + Django REST Framework + Django Channels backend for a Raspberry Pi posture and screen-distance monitoring school demo.
+A lightweight, single-process Django 5 + Django REST Framework + Django Channels backend for a Raspberry Pi posture and screen-distance monitoring school demo, including remote calibration commands.
 
 ---
 
@@ -49,7 +49,9 @@ python tools/fake_pi.py --base http://localhost:8000 --fast
 | `GET` | `/api/events/` | App | Lists recent alert events (newest first). Supports `?limit=50&kind=&since=`. |
 | `POST` | `/api/aggregates/` | Pi (1/min) | Upserts a `MinuteAggregate` row keyed by `window_start`. |
 | `GET` | `/api/aggregates/` | App | Lists per-minute rows ordered by `window_start`. Supports `?from=&to=`. |
-| `GET` | `/api/summary/` | App | Computes hourly or daily chart buckets in Python (`?granularity=hour|day&from=&to=`). |
+| `GET` | `/api/summary/` | App | Computes hourly or daily chart buckets in Python (`?granularity=hour\|day&from=&to=`). |
+| `POST` | `/api/commands/` | App | Sends a calibration command (`calibrate_camera` or `calibrate_distance`) to the connected Pi (`202` if sent, `503` if Pi is offline). |
+| `GET` | `/api/device/` | App | Returns `{"connected": true\|false}` based on active `/ws/device/` connections. |
 
 ### `curl` Examples
 
@@ -130,13 +132,39 @@ curl -s "http://localhost:8000/api/summary/?granularity=hour"
 curl -s "http://localhost:8000/api/summary/?granularity=day"
 ```
 
+**Check whether the Pi is connected (from App):**
+```bash
+curl -s http://localhost:8000/api/device/
+```
+
+**Trigger remote calibration (from App):**
+```bash
+curl -i -X POST http://localhost:8000/api/commands/ \
+  -H "Content-Type: application/json" \
+  -d '{"command": "calibrate_camera"}'
+```
+
 ---
 
-## 3. How to Test the WebSocket
+## 3. WebSockets & Message Formats
 
-Connect to `ws://localhost:8000/ws/notifications/`. Upon connection, the server immediately sends the current `LatestStatus` (if one exists) and then streams live `"status"` and `"alert"` JSON messages.
+### A. App WebSocket: `ws://<host>:8000/ws/notifications/`
+Push-only stream for the Flutter app. On connect, it immediately sends `LatestStatus` (if any) followed by the current Pi connection state.
 
-### Option A: Python snippet using `websockets`
+* **Live status:** `{"type": "status", "data": {"ts", "label", "confidence", "distance_cm", "distance_state", "posture_alert", "distance_alert"}}`
+* **Live alert:** `{"type": "alert", "data": {"kind", "label", "message", "ts"}}`
+* **Pi connection state:** `{"type": "device", "data": {"connected": true}}`
+* **Calibration progress:** `{"type": "command_result", "data": {"command": "calibrate_camera", "status": "recording", "detail": "Hold upright", "ts": "2026-05-10T14:05:00Z"}}`
+
+### B. Pi Agent WebSocket: `ws://<host>:8000/ws/device/`
+Bidirectional channel for the Raspberry Pi agent.
+
+* **Backend -> Pi (command):**
+  `{"type": "command", "command": "calibrate_camera"}` (or `"calibrate_distance"`)
+* **Pi -> Backend (progress):**
+  `{"type": "command_result", "command": "calibrate_camera", "status": "get_ready" | "recording" | "done" | "failed", "detail": "optional text"}`
+
+### Testing WebSockets
 
 ```python
 import asyncio
@@ -152,68 +180,79 @@ async def listen():
 asyncio.run(listen())
 ```
 
-### Option B: Using `websocat` from the terminal
-
+Or with `websocat`:
 ```bash
 websocat ws://localhost:8000/ws/notifications/
+websocat ws://localhost:8000/ws/device/
 ```
 
 ---
 
 ## 4. End-to-End Data Flow
 
-1. **Camera Analysis on the Pi:** The Raspberry Pi analyses the user's posture and screen distance locally and sends JSON telemetry over plain HTTP (`POST /api/status/`, `/api/events/`, `/api/aggregates/`) to Daphne on port 8000.
-2. **ASGI Protocol Routing:** Daphne's `ProtocolTypeRouter` directs HTTP requests to Django REST Framework views and WebSocket connections (`/ws/notifications/`) to `NotificationConsumer`.
-3. **Validation & SQLite Persistence:** DRF serializers validate all fields and save data to SQLite—overwriting `pk=1` for `LatestStatus`, deduplicating `AlertEvent` by `event_id`, and upserting `MinuteAggregate` by `window_start`.
-4. **Sync-to-Async Channel Bridge:** When a status update or `"start"` alert is saved, the synchronous DRF view calls `async_to_sync(channel_layer.group_send)("notifications", ...)` to push the payload into the `InMemoryChannelLayer`.
-5. **WebSocket Broadcast to Flutter:** Every connected `NotificationConsumer` receives the group event and pushes the JSON frame over the open WebSocket to the Flutter mobile app.
-6. **App UI Updates & Dashboard Reads:** The Flutter app displays or clears alert banners immediately from WebSocket frames, and fetches historical charts via `GET /api/summary/` and `GET /api/events/`.
+1. **Telemetry (Pi -> App):** The Pi posts posture status, alert events, and minute aggregates over HTTP to Daphne on port 8000.
+2. **Persistence & Broadcast:** DRF views validate payloads, persist them to SQLite, and call `async_to_sync(channel_layer.group_send)` to push `"status"` and `"alert"` frames to `/ws/notifications/`.
+3. **Pi Presence:** When the Pi connects to `/ws/device/`, `DeviceConsumer` increments `connected_devices` and broadcasts `{"type": "device", "data": {"connected": true}}` to the app (and `false` on disconnect).
+4. **Remote Calibration Command:** The Flutter app sends `POST /api/commands/` with `{"command": "calibrate_camera"}`.
+5. **Command Dispatch:** If `connected_devices > 0`, Django pushes `{"type": "command", "command": ...}` to the `"device"` group over `/ws/device/` and returns `202 Accepted`.
+6. **Calibration Progress:** As the Pi runs calibration, it sends `"command_result"` JSON frames (`get_ready`, `recording`, `done`, `failed`) over `/ws/device/`, which Django validates, timestamps, and forwards to `/ws/notifications/`.
 
 ---
 
 ## 5. Design Decisions and Why
 
-- **No authentication or permissions:** The system operates with a single Raspberry Pi and a single user on a trusted local Wi-Fi router. Omitting tokens and user tables keeps the code concise and removes login friction during the live school presentation.
-- **In-memory channel layer (`InMemoryChannelLayer`):** Storing WebSocket groups inside process RAM avoids installing and running a separate Redis server on the Raspberry Pi while providing sub-millisecond broadcast latency.
-- **Per-minute aggregates (`MinuteAggregate`):** Instead of storing raw frame-by-frame pose detections on the backend, the Pi rolls metrics into 60-second buckets. That keeps the database tiny (1,440 rows/day) and makes hourly/daily chart queries instantaneous.
-- **Idempotent upserts (`event_id` and `window_start`):** Wi-Fi connections can drop after the server processes a request but before the Pi receives the HTTP response. Using a Pi-generated UUID (`event_id`) on `AlertEvent` and `update_or_create` on `MinuteAggregate.window_start` guarantees that retries never create duplicate alerts or double-counted minutes.
-- **Status not stored historically (`LatestStatus` `pk=1`):** The Pi posts live status every 5 seconds. Overwriting a single row (`pk=1`) gives new WebSocket clients an immediate snapshot without bloating SQLite with 17,280 status rows per day.
+- **No authentication or permissions:** Single Pi, single user, trusted local Wi-Fi router; avoids login friction during the live demo.
+- **In-memory channel layer (`InMemoryChannelLayer`):** Stores WebSocket groups in process RAM, avoiding a separate Redis server.
+- **Per-minute aggregates (`MinuteAggregate`):** Keeps SQLite tiny (1,440 rows/day) and chart queries fast.
+- **Idempotent upserts (`event_id` and `window_start`):** Retries after brief Wi-Fi drops never create duplicate alerts or double-counted minutes.
+- **Status not stored historically (`LatestStatus` `pk=1`):** Overwriting one row avoids 17,280 status rows/day while giving new WebSocket clients an instant snapshot.
+- **Commands not stored or queued:** Calibration requires the user to be sitting in front of the camera right now; replaying a stale queued command later would calibrate against an empty chair or bad posture.
+- **`503 Service Unavailable` when Pi is offline:** Gives the Flutter app an immediate, explicit error instead of silently accepting a command that cannot be executed.
+- **In-memory `connected_devices` counter:** A single module-level integer is the simplest way to track live Pi presence without database writes on every connect/disconnect.
 
 ---
 
 ## 6. Limitations
 
-- **Notifications only reach an open app:** Because WebSockets require an active TCP connection and we do not use Firebase Cloud Messaging (FCM), the phone only receives live alerts while the Flutter app is open and connected to the LAN.
-- **Single-process only:** `InMemoryChannelLayer` stores state in Python process memory. Running multiple worker processes would isolate their memory spaces, so HTTP posts handled by Worker A would not broadcast to WebSockets connected to Worker B.
-- **No authentication:** Any device on the same local network can post fake data or listen to the WebSocket stream.
-- **Plain HTTP / WS:** Traffic is unencrypted on the local network (`http://` and `ws://` rather than `https://` and `wss://`).
+- **Notifications only reach an open app:** No FCM push notifications; the phone must have the app open on the LAN.
+- **Single-process only:** Both `InMemoryChannelLayer` and the `connected_devices` counter live in Python process RAM, so multiple worker processes would not share state.
+- **Command lost if Pi is offline:** Because commands are not queued, any command sent while the Pi is disconnected returns `503` and must be retried by the user once the Pi reconnects.
+- **No authentication / plain HTTP & WS:** Any device on the same LAN can call the API or connect to either WebSocket.
 
 ---
 
 ## 7. Assumptions
 
-- All timestamps sent by the Pi or passed in query parameters (`since`, `from`, `to`) are valid ISO 8601 strings; if a timestamp lacks a timezone offset, it is assumed to be UTC.
-- `GET /api/summary/` floors `from` and `to` timestamps down to the start of their respective hour (`HH:00:00Z`) or day (`00:00:00Z`) so every bucket aligns cleanly to clock boundaries.
-- Unknown extra JSON fields sent in `POST` bodies are silently ignored by Django REST Framework serializers so minor Pi payload additions never break the backend.
-- The `migrations/` folder includes `0001_initial.py` so `python manage.py migrate` works immediately without needing `makemigrations` first.
+- All timestamps sent by the Pi or passed in query parameters (`since`, `from`, `to`) are valid ISO 8601 strings (naive timestamps default to UTC).
+- `GET /api/summary/` floors `from` and `to` down to clock-aligned hour or day boundaries.
+- Unknown extra JSON fields in `POST` bodies are ignored by DRF serializers.
+- Only one Raspberry Pi connects to `/ws/device/` in normal demo use, though `connected_devices` safely counts multiple connections if a test script connects alongside the Pi.
 
 ---
 
 ## 8. Likely Examiner Questions & Answers
 
 1. **Why must `"daphne"` be placed at the very top of `INSTALLED_APPS`?**
-   Django apps override management commands in the order they appear in `INSTALLED_APPS`. Putting `"daphne"` first replaces Django's default WSGI-only `runserver` command with Daphne's ASGI `runserver`, allowing both HTTP and WebSockets to work seamlessly during development.
-2. **Why do we call `django.core.asgi.get_asgi_application()` in `asgi.py` before importing `monitor.routing`?**
-   `monitor.routing` imports `NotificationConsumer`, which imports `LatestStatus` from `monitor.models`. Django models cannot be imported until `django.setup()` has populated the app registry, which `get_asgi_application()` executes.
+   So Daphne overrides Django's default WSGI-only `runserver` with an ASGI-capable server that supports both HTTP and WebSockets.
+2. **Why do we call `get_asgi_application()` in `asgi.py` before importing `monitor.routing`?**
+   `monitor.routing` imports consumers that import Django models, which requires Django's app registry to be initialized first.
 3. **How can a synchronous DRF view broadcast to an asynchronous WebSocket consumer?**
-   We wrap `channel_layer.group_send(...)` in `asgiref.sync.async_to_sync()`. This helper schedules the async `group_send` coroutine onto the main ASGI event loop and waits for it to queue the message before returning control to the synchronous HTTP view thread.
-4. **Why don't we broadcast a WebSocket `"alert"` message when an alert `"end"` event is posted?**
-   The mobile app clears its active alert banner automatically as soon as it receives a regular `"status"` WebSocket message with `posture_alert: false` and `distance_alert: false`. The `"end"` event only needs to be recorded in SQLite so we know `duration_s` for historical logs.
-5. **How does the backend calculate `good_percent` in `GET /api/summary/`?**
-   For each hour or day bucket, Python sums all values in `seconds_per_label` except `"unknown"`. If that known total is greater than zero, `good_percent = (goodposture_seconds / known_total_seconds) * 100`; otherwise it returns `null` to avoid division by zero.
-6. **Why is `avg_distance_cm` in `/api/summary/` a weighted average instead of a simple mean of minutes?**
-   A minute where the user sat in front of the camera for 30 detections carries more real data than a minute where the user walked away after 2 detections. Weighting each minute's `avg_distance_cm` by its `detections` count produces the true average distance across all detected frames.
-7. **What happens if the Raspberry Pi loses Wi-Fi briefly and sends the same `POST /api/events/` request twice?**
-   Before creating a row, `events_view` checks `AlertEvent.objects.filter(event_id=...).first()`. If the UUID already exists, the backend returns `200 OK` with the existing row and skips both database insertion and WebSocket broadcasting.
-8. **If we wanted to deploy this to the cloud for multiple users and multiple server workers later, what would we change?**
-   We would swap `InMemoryChannelLayer` for `channels_redis` (so multiple ASGI workers share WebSocket groups), switch SQLite to PostgreSQL, add token authentication with a `Device`/`User` foreign key on all models, and integrate FCM push notifications for background alerts.
+   `asgiref.sync.async_to_sync(channel_layer.group_send)` submits the async coroutine to the ASGI event loop and waits briefly for it to queue the message.
+4. **Why don't we broadcast a WebSocket `"alert"` message on `"end"` events?**
+   The app clears its alert banner when a `"status"` message arrives with `posture_alert: false` and `distance_alert: false`; `"end"` is stored only for historical duration logs.
+5. **How does `GET /api/summary/` calculate `good_percent`?**
+   It sums all `seconds_per_label` values except `"unknown"`, then divides `goodposture` seconds by that known total (returning `null` if the total is 0).
+6. **Why is `avg_distance_cm` weighted by `detections`?**
+   So a minute with 30 camera detections carries proportionally more weight than a minute with only 2 detections.
+7. **What happens if the Pi retries the same `POST /api/events/` request?**
+   The backend looks up `event_id`; if it already exists, it returns `200 OK` without inserting a second row or re-broadcasting.
+8. **What would change for a multi-user cloud deployment?**
+   Replace `InMemoryChannelLayer` with `channels_redis`, SQLite with PostgreSQL, add token auth + device foreign keys, and add FCM push notifications.
+9. **Why does `POST /api/commands/` return `202 Accepted` instead of `200 OK`?**
+   `202 Accepted` accurately signals that the backend has forwarded the command to the Pi, but calibration itself happens asynchronously on the Pi and reports progress later over WebSocket.
+10. **Why don't we store calibration commands in SQLite and deliver them when the Pi reconnects?**
+    Calibration requires the user to be actively sitting upright in front of the camera at that moment; executing a delayed command later would produce invalid calibration data.
+11. **Why is `connected_devices` a simple Python integer instead of a database column?**
+    In a single-process ASGI server, an in-memory counter is instant and always reflects live sockets—whereas a database flag can get stuck as `True` if the server crashes or restarts.
+12. **Why does `DeviceConsumer.receive_json` validate incoming Pi messages with a DRF serializer?**
+    Validating with `CommandResultSerializer` guarantees that only expected `command` and `status` values reach the Flutter app, preventing malformed Pi messages from crashing the mobile UI.

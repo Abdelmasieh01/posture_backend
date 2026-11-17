@@ -13,4 +13,6 @@ urlpatterns = [
     path("events/", views.events_view, name="events"),
     path("aggregates/", views.aggregates_view, name="aggregates"),
     path("summary/", views.summary_view, name="summary"),
+    path("commands/", views.commands_view, name="commands"),
+    path("device/", views.device_view, name="device"),
 ]

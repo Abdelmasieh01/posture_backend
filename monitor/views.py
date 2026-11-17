@@ -1,5 +1,5 @@
 """
-REST API endpoint implementations for health, status, events, aggregates, and summaries.
+REST API endpoint implementations for health, status, events, aggregates, summary, and commands.
 Exists to handle HTTP requests from the Raspberry Pi and the Flutter mobile app.
 Called by Django's URL dispatcher when requests match /api/* routes.
 """
@@ -11,10 +11,17 @@ from rest_framework.decorators import api_view
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
+from . import consumers
 from .models import AlertEvent, LatestStatus, MinuteAggregate
-from .notifications import broadcast_notification, get_alert_message
+from .notifications import (
+    broadcast_notification,
+    build_status_ws_payload,
+    get_alert_message,
+    send_device_command,
+)
 from .serializers import (
     AlertEventSerializer,
+    CommandSerializer,
     MinuteAggregateSerializer,
     StatusSerializer,
     format_iso_utc,
@@ -32,22 +39,6 @@ def parse_iso_param(value: str | None, param_name: str) -> datetime | None:
     if timezone.is_naive(dt):
         dt = timezone.make_aware(dt, dt_timezone.utc)
     return dt.astimezone(dt_timezone.utc)
-
-
-def build_status_ws_payload(status_obj: LatestStatus) -> dict:
-    """Format a LatestStatus row into the exact dictionary expected by WebSocket clients."""
-    return {
-        "type": "status",
-        "data": {
-            "ts": format_iso_utc(status_obj.ts),
-            "label": status_obj.label,
-            "confidence": status_obj.confidence,
-            "distance_cm": status_obj.distance_cm,
-            "distance_state": status_obj.distance_state,
-            "posture_alert": status_obj.posture_alert,
-            "distance_alert": status_obj.distance_alert,
-        },
-    }
 
 
 @api_view(["GET"])
@@ -281,3 +272,34 @@ def summary_view(request):
         )
 
     return Response(result)
+
+
+@api_view(["POST"])
+def commands_view(request):
+    """
+    POST /api/commands/ -> Forward a live calibration command to the connected Pi.
+    Commands are NOT stored in the database and NOT queued: a calibration requires the user
+    to be sitting in front of the camera right now, so replaying an old queued command later
+    when the Pi reconnects would calibrate against an empty chair or wrong posture.
+    """
+    serializer = CommandSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    if consumers.connected_devices == 0:
+        return Response(
+            {"detail": "Pi not connected"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    command_name = serializer.validated_data["command"]
+    send_device_command(command_name)
+    return Response(
+        {"sent": True, "command": command_name},
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+@api_view(["GET"])
+def device_view(request):
+    """GET /api/device/ -> Report whether at least one Raspberry Pi agent is connected."""
+    return Response({"connected": consumers.connected_devices > 0})

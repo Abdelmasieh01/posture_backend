@@ -1,10 +1,12 @@
 """
-Alert message dictionary and WebSocket broadcast helper.
-Exists to keep human-readable notification strings and Channels group_send logic in one place.
-Called by views.py when status updates or new alert events arrive from the Pi.
+Alert message dictionary and WebSocket broadcast helpers for app and Pi groups.
+Exists to keep notification strings and Channels group_send logic in one place.
+Called by views.py and consumers.py when pushing status, alerts, or calibration commands.
 """
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+
+from .serializers import format_iso_utc
 
 # Single dictionary mapping posture/distance labels to user-friendly coaching advice
 ALERT_MESSAGES = {
@@ -15,8 +17,9 @@ ALERT_MESSAGES = {
 }
 DEFAULT_ALERT_MESSAGE = "Bad posture detected."
 
-# Single Channels group name shared by all connected Flutter clients
+# Channels group names: one for connected Flutter apps, one for the Raspberry Pi agent
 NOTIFICATION_GROUP = "notifications"
+DEVICE_GROUP = "device"
 
 
 def get_alert_message(kind: str, label: str) -> str:
@@ -24,6 +27,22 @@ def get_alert_message(kind: str, label: str) -> str:
     if kind == "distance" or label == "tooclose":
         return ALERT_MESSAGES["tooclose"]
     return ALERT_MESSAGES.get(label, DEFAULT_ALERT_MESSAGE)
+
+
+def build_status_ws_payload(status_obj) -> dict:
+    """Format a LatestStatus row into the exact dictionary expected by WebSocket clients."""
+    return {
+        "type": "status",
+        "data": {
+            "ts": format_iso_utc(status_obj.ts),
+            "label": status_obj.label,
+            "confidence": status_obj.confidence,
+            "distance_cm": status_obj.distance_cm,
+            "distance_state": status_obj.distance_state,
+            "posture_alert": status_obj.posture_alert,
+            "distance_alert": status_obj.distance_alert,
+        },
+    }
 
 
 def broadcast_notification(payload: dict) -> None:
@@ -45,5 +64,23 @@ def broadcast_notification(payload: dict) -> None:
             {
                 "type": "notify_message",
                 "payload": payload,
+            },
+        )
+
+
+def send_device_command(command: str) -> None:
+    """
+    Send a calibration command to the connected Raspberry Pi in the 'device' group.
+    Uses async_to_sync for the same reason as broadcast_notification: bridging sync DRF
+    views to the async Channels layer.
+    """
+    channel_layer = get_channel_layer()
+    if channel_layer is not None:
+        # "device_command" maps to the `device_command` method on DeviceConsumer
+        async_to_sync(channel_layer.group_send)(
+            DEVICE_GROUP,
+            {
+                "type": "device_command",
+                "command": command,
             },
         )
