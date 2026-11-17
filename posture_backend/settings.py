@@ -22,6 +22,7 @@ ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*", cast=Csv())
 # management command with an ASGI-capable server that handles both HTTP and WebSockets.
 INSTALLED_APPS = [
     "daphne",
+    "corsheaders",
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.staticfiles",
@@ -31,6 +32,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
 ]
@@ -89,3 +91,5 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+CORS_ALLOW_ALL_ORIGINS = True
