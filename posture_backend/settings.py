@@ -3,6 +3,7 @@ Central configuration for the posture_backend Django project.
 Exists to configure SQLite, Django REST Framework, and Django Channels (Daphne).
 Called automatically by Django when the server or a management command starts.
 """
+
 from pathlib import Path
 from decouple import Csv, config
 
@@ -41,7 +42,13 @@ TEMPLATES = [
         "BACKEND": "django.template.backends.django.DjangoTemplates",
         "DIRS": [],
         "APP_DIRS": True,
-        "OPTIONS": {"context_processors": []},
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.template.context_processors.static",
+            ],
+        },
     },
 ]
 
