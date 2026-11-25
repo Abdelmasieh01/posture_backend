@@ -1,7 +1,7 @@
 """
-Database schema definitions for posture status, alert events, and minute aggregates.
-Exists to persist Raspberry Pi telemetry in SQLite using Django's ORM.
-Called by serializers, views, WebSocket consumers, and management commands.
+Database schema definitions for status, alert events, minute aggregates, and snapshots.
+Exists to persist Raspberry Pi telemetry and JPEG frames in SQLite using Django's ORM.
+Called by serializers, views, admin, WebSocket consumers, and management commands.
 """
 from django.db import models
 
@@ -54,4 +54,17 @@ class MinuteAggregate(models.Model):
     seconds_too_close = models.FloatField(default=0.0)
     detections = models.IntegerField()
     avg_angles = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class Snapshot(models.Model):
+    """
+    Stores a single JPEG frame captured by the Pi during an active bad-posture alert.
+    `event_id` links the frame to the alert's "start" event UUID without a strict ForeignKey,
+    so a snapshot arriving slightly before or out of order with /api/events/ still saves cleanly.
+    """
+    event_id = models.UUIDField(db_index=True)
+    ts = models.DateTimeField(db_index=True)
+    label = models.CharField(max_length=64)
+    image = models.ImageField(upload_to="snapshots/")
     created_at = models.DateTimeField(auto_now_add=True)

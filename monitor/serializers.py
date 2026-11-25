@@ -1,13 +1,15 @@
 """
 Input validation and JSON serialization for the monitor REST API and WebSockets.
-Exists to validate types, required fields, and choices before touching the DB or Channels.
+Exists to validate types, required fields, image constraints, and choices before saving.
 Called by views.py and consumers.py on incoming payloads.
 """
+from PIL import Image, UnidentifiedImageError
 from rest_framework import serializers
-from .models import AlertEvent, LatestStatus, MinuteAggregate
+from .models import AlertEvent, LatestStatus, MinuteAggregate, Snapshot
 
 VALID_COMMANDS = ["calibrate_camera", "calibrate_distance"]
 VALID_COMMAND_STATUSES = ["get_ready", "recording", "done", "failed"]
+MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024  # 2 MB limit to protect SD card / disk space
 
 
 def format_iso_utc(dt) -> str:
@@ -103,3 +105,45 @@ class CommandResultSerializer(serializers.Serializer):
     command = serializers.ChoiceField(choices=VALID_COMMANDS)
     status = serializers.ChoiceField(choices=VALID_COMMAND_STATUSES)
     detail = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class SnapshotSerializer(serializers.ModelSerializer):
+    """Validates multipart JPEG uploads and serializes Snapshot rows with absolute image_url."""
+    image = serializers.ImageField(write_only=True)
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Snapshot
+        fields = ["id", "event_id", "ts", "label", "image", "image_url", "created_at"]
+        read_only_fields = ["id", "image_url", "created_at"]
+
+    def validate_image(self, uploaded_file):
+        # Reject files larger than 2 MB before processing
+        if uploaded_file.size > MAX_SNAPSHOT_BYTES:
+            raise serializers.ValidationError("Image size must not exceed 2 MB.")
+
+        # Verify actual image headers with Pillow rather than trusting the filename extension
+        try:
+            uploaded_file.seek(0)
+            with Image.open(uploaded_file) as img:
+                img_format = img.format
+            uploaded_file.seek(0)
+        except (UnidentifiedImageError, OSError):
+            raise serializers.ValidationError("Uploaded file is not a valid image.")
+
+        if img_format != "JPEG":
+            raise serializers.ValidationError("Only JPEG images are allowed.")
+
+        return uploaded_file
+
+    def get_image_url(self, obj) -> str:
+        """Build an absolute URL (e.g. http://host:8000/media/snapshots/frame.jpg)."""
+        request = self.context.get("request")
+        url = obj.image.url
+        return request.build_absolute_uri(url) if request is not None else url
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.ts:
+            data["ts"] = format_iso_utc(instance.ts)
+        return data

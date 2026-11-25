@@ -15,4 +15,5 @@ urlpatterns = [
     path("summary/", views.summary_view, name="summary"),
     path("commands/", views.commands_view, name="commands"),
     path("device/", views.device_view, name="device"),
+    path("snapshots/", views.snapshots_view, name="snapshots"),
 ]

@@ -1,18 +1,31 @@
 """
-Automated test suite covering REST endpoints, idempotency, summary math, WebSockets, and commands.
+Automated test suite covering REST endpoints, idempotency, summary math, WebSockets, commands, and snapshots.
 Exists to verify all exam specification requirements with `python manage.py test`.
 Called by Django's test runner.
 """
+import io
+import shutil
+import tempfile
 import uuid
 from datetime import datetime, timezone as dt_timezone
 from asgiref.sync import async_to_sync
 from channels.db import database_sync_to_async
 from channels.testing import WebsocketCommunicator
-from django.test import TestCase, TransactionTestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, TransactionTestCase, override_settings
+from PIL import Image
 
 from posture_backend.asgi import application
 from . import consumers
-from .models import AlertEvent, LatestStatus, MinuteAggregate
+from .models import AlertEvent, LatestStatus, MinuteAggregate, Snapshot
+
+
+def make_test_jpeg(color=(200, 50, 50)) -> SimpleUploadedFile:
+    """Generate a tiny valid in-memory JPEG file for multipart upload tests."""
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), color=color).save(buf, format="JPEG")
+    buf.seek(0)
+    return SimpleUploadedFile("frame.jpg", buf.read(), content_type="image/jpeg")
 
 
 class PostureBackendTests(TestCase):
@@ -163,6 +176,100 @@ class PostureBackendTests(TestCase):
         )
         self.assertEqual(offline_res.status_code, 503)
         self.assertEqual(offline_res.json(), {"detail": "Pi not connected"})
+
+
+class SnapshotTests(TestCase):
+    """Tests for POST/GET /api/snapshots/ validation, filtering, and 200-row cap."""
+
+    def setUp(self):
+        self.temp_media = tempfile.mkdtemp()
+        self.override = override_settings(MEDIA_ROOT=self.temp_media)
+        self.override.enable()
+
+    def tearDown(self):
+        self.override.disable()
+        shutil.rmtree(self.temp_media, ignore_errors=True)
+
+    def test_valid_snapshot_upload_and_filter_by_event_id(self):
+        ev1 = str(uuid.uuid4())
+        ev2 = str(uuid.uuid4())
+
+        r1 = self.client.post(
+            "/api/snapshots/",
+            {
+                "event_id": ev1,
+                "ts": "2026-11-14T03:50:41Z",
+                "label": "forwardbadposture",
+                "image": make_test_jpeg(),
+            },
+        )
+        self.assertEqual(r1.status_code, 201)
+        body1 = r1.json()
+        self.assertIn("id", body1)
+        self.assertTrue(body1["image_url"].startswith("http://testserver/media/snapshots/"))
+
+        r2 = self.client.post(
+            "/api/snapshots/",
+            {
+                "event_id": ev2,
+                "ts": "2026-11-14T03:50:46Z",
+                "label": "headforward",
+                "image": make_test_jpeg(),
+            },
+        )
+        self.assertEqual(r2.status_code, 201)
+
+        # Unfiltered GET returns newest first (ev2 before ev1)
+        all_res = self.client.get("/api/snapshots/")
+        self.assertEqual(all_res.status_code, 200)
+        items = all_res.json()
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["event_id"], ev2)
+
+        # Filtered GET returns only matching event_id
+        filtered_res = self.client.get(f"/api/snapshots/?event_id={ev1}")
+        self.assertEqual(filtered_res.status_code, 200)
+        filtered = filtered_res.json()
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["event_id"], ev1)
+        self.assertTrue(filtered[0]["image_url"].startswith("http://testserver/media/snapshots/"))
+
+    def test_rejects_non_jpeg_and_oversized_snapshot(self):
+        ev_id = str(uuid.uuid4())
+
+        # 1. PNG image should be rejected with 400
+        png_buf = io.BytesIO()
+        Image.new("RGB", (16, 16), color=(0, 255, 0)).save(png_buf, format="PNG")
+        png_buf.seek(0)
+        png_file = SimpleUploadedFile("bad.png", png_buf.read(), content_type="image/png")
+
+        res_png = self.client.post(
+            "/api/snapshots/",
+            {
+                "event_id": ev_id,
+                "ts": "2026-11-14T03:50:41Z",
+                "label": "forwardbadposture",
+                "image": png_file,
+            },
+        )
+        self.assertEqual(res_png.status_code, 400)
+        self.assertIn("image", res_png.json())
+
+        # 2. File larger than 2 MB should be rejected with 400
+        huge_file = SimpleUploadedFile(
+            "huge.jpg", b"x" * (2 * 1024 * 1024 + 10), content_type="image/jpeg"
+        )
+        res_huge = self.client.post(
+            "/api/snapshots/",
+            {
+                "event_id": ev_id,
+                "ts": "2026-11-14T03:50:41Z",
+                "label": "forwardbadposture",
+                "image": huge_file,
+            },
+        )
+        self.assertEqual(res_huge.status_code, 400)
+        self.assertEqual(Snapshot.objects.count(), 0)
 
 
 class WebSocketTests(TransactionTestCase):

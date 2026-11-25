@@ -1,6 +1,6 @@
 """
 Central configuration for the posture_backend Django project.
-Exists to configure SQLite, Django REST Framework, and Django Channels (Daphne).
+Exists to configure SQLite, media uploads, DRF, and Django Channels (Daphne).
 Called automatically by Django when the server or a management command starts.
 """
 
@@ -23,8 +23,11 @@ ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*", cast=Csv())
 INSTALLED_APPS = [
     "daphne",
     "corsheaders",
+    "django.contrib.admin",
     "django.contrib.contenttypes",
     "django.contrib.auth",
+    "django.contrib.sessions",
+    "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
     "channels",
@@ -34,8 +37,13 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
 ]
+
+CORS_ALLOW_ALL_ORIGINS = True
 
 ROOT_URLCONF = "posture_backend.urls"
 
@@ -48,7 +56,8 @@ TEMPLATES = [
             "context_processors": [
                 "django.template.context_processors.debug",
                 "django.template.context_processors.request",
-                "django.template.context_processors.static",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
@@ -74,7 +83,7 @@ CHANNEL_LAYERS = {
     }
 }
 
-# Disable authentication and permissions completely because the demo runs on a trusted LAN
+# Disable authentication and permissions on API endpoints because the demo runs on a trusted LAN
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [],
     "DEFAULT_PERMISSION_CLASSES": [
@@ -89,7 +98,11 @@ USE_I18N = True
 # Store all datetimes in UTC in the database to match the Pi's ISO 8601 UTC timestamps
 USE_TZ = True
 
-STATIC_URL = "static/"
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
-CORS_ALLOW_ALL_ORIGINS = True
+# Local directory and URL prefix for uploaded JPEG posture snapshots
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

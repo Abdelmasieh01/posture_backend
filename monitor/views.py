@@ -1,18 +1,20 @@
 """
-REST API endpoint implementations for health, status, events, aggregates, summary, and commands.
+REST API endpoint implementations for health, status, events, aggregates, summary, commands, and snapshots.
 Exists to handle HTTP requests from the Raspberry Pi and the Flutter mobile app.
 Called by Django's URL dispatcher when requests match /api/* routes.
 """
+import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, parser_classes
 from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from . import consumers
-from .models import AlertEvent, LatestStatus, MinuteAggregate
+from .models import AlertEvent, LatestStatus, MinuteAggregate, Snapshot
 from .notifications import (
     broadcast_notification,
     build_status_ws_payload,
@@ -23,9 +25,12 @@ from .serializers import (
     AlertEventSerializer,
     CommandSerializer,
     MinuteAggregateSerializer,
+    SnapshotSerializer,
     StatusSerializer,
     format_iso_utc,
 )
+
+MAX_SNAPSHOT_ROWS = 200
 
 
 def parse_iso_param(value: str | None, param_name: str) -> datetime | None:
@@ -303,3 +308,61 @@ def commands_view(request):
 def device_view(request):
     """GET /api/device/ -> Report whether at least one Raspberry Pi agent is connected."""
     return Response({"connected": consumers.connected_devices > 0})
+
+
+def _prune_old_snapshots() -> None:
+    """
+    Keep only the latest 200 Snapshot rows and delete older JPEG files from disk.
+    Django's QuerySet.delete() does NOT remove files from storage automatically, so we
+    explicitly call `snap.image.delete(save=False)` on each evicted row first.
+    """
+    stale_snapshots = Snapshot.objects.order_by("-ts", "-id")[MAX_SNAPSHOT_ROWS:]
+    for snap in stale_snapshots:
+        if snap.image:
+            snap.image.delete(save=False)
+        snap.delete()
+
+
+@api_view(["GET", "POST"])
+@parser_classes([MultiPartParser, FormParser])
+def snapshots_view(request):
+    """
+    POST /api/snapshots/ -> Validate & store a JPEG frame, prune beyond 200 rows, and broadcast.
+    GET /api/snapshots/ -> List snapshots newest first, optionally filtered by ?event_id=<uuid>.
+    """
+    if request.method == "POST":
+        serializer = SnapshotSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        snap = serializer.save()
+
+        # Cap total stored snapshots at 200 so the Raspberry Pi's SD card doesn't fill up
+        _prune_old_snapshots()
+
+        image_url = request.build_absolute_uri(snap.image.url)
+        broadcast_notification(
+            {
+                "type": "snapshot",
+                "event_id": str(snap.event_id),
+                "label": snap.label,
+                "ts": format_iso_utc(snap.ts),
+                "image_url": image_url,
+            }
+        )
+        return Response(
+            {"id": snap.id, "image_url": image_url},
+            status=status.HTTP_201_CREATED,
+        )
+
+    # GET /api/snapshots/?event_id=<uuid>
+    qs = Snapshot.objects.all()
+    event_id_param = request.query_params.get("event_id")
+    if event_id_param:
+        try:
+            parsed_uuid = uuid.UUID(event_id_param)
+        except ValueError:
+            raise ValidationError({"event_id": "Invalid UUID format."})
+        qs = qs.filter(event_id=parsed_uuid)
+
+    snapshots = qs.order_by("-ts", "-id")
+    serializer = SnapshotSerializer(snapshots, many=True, context={"request": request})
+    return Response(serializer.data)

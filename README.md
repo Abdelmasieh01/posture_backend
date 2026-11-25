@@ -1,6 +1,6 @@
 # Posture Monitor Demo Backend (`posture_backend`)
 
-A lightweight, single-process Django 5 + Django REST Framework + Django Channels backend for a Raspberry Pi posture and screen-distance monitoring school demo, including remote calibration commands.
+A lightweight, single-process Django 5 + Django REST Framework + Django Channels backend for a Raspberry Pi posture and screen-distance monitoring school demo, including remote calibration commands and bad-posture JPEG snapshots.
 
 ---
 
@@ -14,17 +14,19 @@ source .venv/bin/activate
 # 2. Install pinned dependencies
 pip install -r requirements.txt
 
-# 3. Create database tables in db.sqlite3
-python manage.py makemigrations monitor
+# 3. Apply database migrations in db.sqlite3
 python manage.py migrate
 
-# 4. (Optional) Seed 24 hours of demo chart & alert data for the Flutter app
+# 4. (Optional) Create an admin superuser to inspect snapshots at /admin/
+python manage.py createsuperuser
+
+# 5. (Optional) Seed 24 hours of demo chart & alert data for the Flutter app
 python manage.py seed_demo_data --hours 24
 
-# 5. Run the automated test suite
+# 6. Run the automated test suite
 python manage.py test
 
-# 6. Start the ASGI server on all network interfaces (port 8000)
+# 7. Start the ASGI server on all network interfaces (port 8000)
 daphne -b 0.0.0.0 -p 8000 posture_backend.asgi:application
 # Or during development (also uses Daphne because daphne is first in INSTALLED_APPS):
 python manage.py runserver 0.0.0.0:8000
@@ -52,6 +54,8 @@ python tools/fake_pi.py --base http://localhost:8000 --fast
 | `GET` | `/api/summary/` | App | Computes hourly or daily chart buckets in Python (`?granularity=hour\|day&from=&to=`). |
 | `POST` | `/api/commands/` | App | Sends a calibration command (`calibrate_camera` or `calibrate_distance`) to the connected Pi (`202` if sent, `503` if Pi is offline). |
 | `GET` | `/api/device/` | App | Returns `{"connected": true\|false}` based on active `/ws/device/` connections. |
+| `POST` | `/api/snapshots/` | Pi (during alert) | Accepts `multipart/form-data` JPEG (<= 2 MB), saves up to 200 latest frames, broadcasts `"snapshot"`, returns `201` with `id` and `image_url`. |
+| `GET` | `/api/snapshots/` | App | Lists snapshots newest first with `image_url`. Supports optional `?event_id=<uuid>`. |
 
 ### `curl` Examples
 
@@ -144,6 +148,21 @@ curl -i -X POST http://localhost:8000/api/commands/ \
   -d '{"command": "calibrate_camera"}'
 ```
 
+**Upload a bad-posture JPEG snapshot (from Pi):**
+```bash
+curl -F event_id=550e8400-e29b-41d4-a716-446655440000 \
+  -F ts=2026-11-14T03:50:41Z \
+  -F label=forwardbadposture \
+  -F image=@frame.jpg \
+  http://localhost:8000/api/snapshots/
+```
+
+**List snapshots (all or filtered by alert `event_id`):**
+```bash
+curl -s http://localhost:8000/api/snapshots/
+curl -s "http://localhost:8000/api/snapshots/?event_id=550e8400-e29b-41d4-a716-446655440000"
+```
+
 ---
 
 ## 3. WebSockets & Message Formats
@@ -155,6 +174,7 @@ Push-only stream for the Flutter app. On connect, it immediately sends `LatestSt
 * **Live alert:** `{"type": "alert", "data": {"kind", "label", "message", "ts"}}`
 * **Pi connection state:** `{"type": "device", "data": {"connected": true}}`
 * **Calibration progress:** `{"type": "command_result", "data": {"command": "calibrate_camera", "status": "recording", "detail": "Hold upright", "ts": "2026-05-10T14:05:00Z"}}`
+* **New snapshot:** `{"type": "snapshot", "event_id": "550e8400-e29b-41d4-a716-446655440000", "label": "forwardbadposture", "ts": "2026-11-14T03:50:41Z", "image_url": "http://localhost:8000/media/snapshots/frame.jpg"}`
 
 ### B. Pi Agent WebSocket: `ws://<host>:8000/ws/device/`
 Bidirectional channel for the Raspberry Pi agent.
@@ -192,9 +212,9 @@ websocat ws://localhost:8000/ws/device/
 
 1. **Telemetry (Pi -> App):** The Pi posts posture status, alert events, and minute aggregates over HTTP to Daphne on port 8000.
 2. **Persistence & Broadcast:** DRF views validate payloads, persist them to SQLite, and call `async_to_sync(channel_layer.group_send)` to push `"status"` and `"alert"` frames to `/ws/notifications/`.
-3. **Pi Presence:** When the Pi connects to `/ws/device/`, `DeviceConsumer` increments `connected_devices` and broadcasts `{"type": "device", "data": {"connected": true}}` to the app (and `false` on disconnect).
-4. **Remote Calibration Command:** The Flutter app sends `POST /api/commands/` with `{"command": "calibrate_camera"}`.
-5. **Command Dispatch:** If `connected_devices > 0`, Django pushes `{"type": "command", "command": ...}` to the `"device"` group over `/ws/device/` and returns `202 Accepted`.
+3. **Bad-Posture Snapshots:** While a posture alert is active, the Pi uploads JPEG frames via `POST /api/snapshots/`; Django stores the image under `media/snapshots/`, deletes anything past the newest 200 rows, and broadcasts a `"snapshot"` message with `image_url`.
+4. **Pi Presence:** When the Pi connects to `/ws/device/`, `DeviceConsumer` increments `connected_devices` and broadcasts `{"type": "device", "data": {"connected": true}}` to the app (and `false` on disconnect).
+5. **Remote Calibration Command:** The Flutter app sends `POST /api/commands/` with `{"command": "calibrate_camera"}`; if `connected_devices > 0`, Django pushes `{"type": "command", "command": ...}` over `/ws/device/` and returns `202 Accepted`.
 6. **Calibration Progress:** As the Pi runs calibration, it sends `"command_result"` JSON frames (`get_ready`, `recording`, `done`, `failed`) over `/ws/device/`, which Django validates, timestamps, and forwards to `/ws/notifications/`.
 
 ---
@@ -206,6 +226,7 @@ websocat ws://localhost:8000/ws/device/
 - **Per-minute aggregates (`MinuteAggregate`):** Keeps SQLite tiny (1,440 rows/day) and chart queries fast.
 - **Idempotent upserts (`event_id` and `window_start`):** Retries after brief Wi-Fi drops never create duplicate alerts or double-counted minutes.
 - **Status not stored historically (`LatestStatus` `pk=1`):** Overwriting one row avoids 17,280 status rows/day while giving new WebSocket clients an instant snapshot.
+- **Rolling 200-snapshot cap with file cleanup:** Deleting both the oldest database rows and their underlying files prevents the Raspberry Pi's SD card from filling up over long sessions.
 - **Commands not stored or queued:** Calibration requires the user to be sitting in front of the camera right now; replaying a stale queued command later would calibrate against an empty chair or bad posture.
 - **`503 Service Unavailable` when Pi is offline:** Gives the Flutter app an immediate, explicit error instead of silently accepting a command that cannot be executed.
 - **In-memory `connected_devices` counter:** A single module-level integer is the simplest way to track live Pi presence without database writes on every connect/disconnect.
